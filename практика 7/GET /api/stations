@@ -1,0 +1,3 @@
+HTTP/1.1 200 OK
+
+{"stations":[{"id":"PC-01","room":"A-101","status":"online"},{"id":"PC-02","room":"A-101","status":"offline"},{"id":"PC-03","room":"A-102","status":"online"}]}
