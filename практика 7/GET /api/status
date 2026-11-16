@@ -1,0 +1,2 @@
+curl.exe http://127.0.0.1:3041/api/status
+curl.exe http://127.0.0.1:3041/api/status
