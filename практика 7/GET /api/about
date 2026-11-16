@@ -1,1 +1,5 @@
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+Cache-Control: no-store
 
+{"service":"NetLab","version":"1.0.0","description":"Учебный HTTP-сервис NetLab","author":"NetLab course"}
