@@ -1,0 +1,20 @@
+import { WebSocketServer } from 'ws';
+
+const wss = new WebSocketServer({
+  host: '127.0.0.1',
+  port: 3061,
+  maxPayload: 2048
+});
+
+wss.on('connection', (socket) => {
+  socket.on('message', (data, isBinary) => {
+    if (isBinary) {
+      socket.send('ERROR: только текст');
+      return;
+    }
+    const message = data.toString('utf8');
+    socket.send('ECHO: ' + message);
+  });
+  socket.on('close', () => console.log('Клиент отключился'));
+  socket.on('error', (error) => console.error('Ошибка:', error.message));
+});
