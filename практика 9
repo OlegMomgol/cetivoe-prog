@@ -1,0 +1,332 @@
+import http from 'node:http';
+import { WebSocketServer, WebSocket } from 'ws';
+
+const HOST = '127.0.0.1';
+const PORT = 3060;
+const MAX_CLIENTS = 20;
+const clients = new Map(); 
+let messageCount = 0;     
+
+const RATE_LIMIT = { max: 5, windowMs: 10_000 };
+
+//  HTML клиента 
+const HTML = `<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>NetLab Chat</title>
+<style>
+  body { font-family: Arial, sans-serif; max-width: 720px;
+         margin: 35px auto; padding: 0 15px; }
+  input, button { padding: 9px; margin: 5px 0; }
+  #messages { height: 260px; overflow-y: auto; border: 1px solid #ccc;
+              padding: 12px; list-style: none; }
+  #messages li { margin-bottom: 7px; }
+  #message { width: 68%; }
+  #users, #counter, #status { color: #555; }
+  .pm { color: #7a3e9d; font-style: italic; }
+</style>
+</head>
+<body>
+  <h1>NetLab Chat</h1>
+
+  <input id="name" placeholder="Ваше имя" maxlength="20">
+  <button id="connect">Подключиться</button>
+  <button id="disconnect" disabled>Отключиться</button>
+
+  <p id="status">Не подключено</p>
+  <p id="users">Онлайн: -</p>
+  <p id="counter">Сообщений: 0</p>
+
+  <ul id="messages"></ul>
+
+  <input id="message" placeholder="Сообщение (или /who, /pm имя текст)" maxlength="200">
+  <button id="send" disabled>Отправить</button>
+
+<script>
+  const nameInput = document.querySelector('#name');
+  const connectBtn = document.querySelector('#connect');
+  const disconnectBtn = document.querySelector('#disconnect');
+  const sendBtn = document.querySelector('#send');
+  const messageInput = document.querySelector('#message');
+  const list = document.querySelector('#messages');
+  const status = document.querySelector('#status');
+  const users = document.querySelector('#users');
+  const counter = document.querySelector('#counter');
+
+  let socket = null;
+
+  function line(text, cls) {
+    const item = document.createElement('li');
+    item.textContent = text;                
+    if (cls) item.className = cls;
+    list.append(item);
+    list.scrollTop = list.scrollHeight;
+  }
+
+  connectBtn.addEventListener('click', () => {
+    const name = nameInput.value.trim();
+    if (!name || name.length > 20) {
+      line('Укажите имя длиной 1–20 символов');
+      return;
+    }
+
+    const url = 'ws://' + location.host + '/ws';
+    socket = new WebSocket(url);
+    connectBtn.disabled = true;
+    status.textContent = 'Подключаемся...';
+
+    socket.addEventListener('open', () => {
+      status.textContent = 'Подключено';
+      sendBtn.disabled = false;
+      disconnectBtn.disabled = false;
+      socket.send(JSON.stringify({ type: 'join', name }));
+    });
+
+    socket.addEventListener('message', (event) => {
+      let packet;
+      try { packet = JSON.parse(event.data); }
+      catch { line('Некорректный ответ сервера'); return; }
+
+      if (packet.type === 'chat') {
+        line('[' + packet.time + '] ' + packet.name + ': ' + packet.text);
+      } else if (packet.type === 'pm') {
+        line('[' + packet.time + '] (личное) ' + packet.name + ': ' + packet.text, 'pm');
+      } else if (packet.type === 'system' || packet.type === 'info') {
+        line('[Система] ' + packet.text);
+      } else if (packet.type === 'online') {
+        users.textContent = 'Онлайн: ' + packet.users
+          .map(u => u.name + ' (' + u.joinedAt + ')')
+          .join(', ');
+      } else if (packet.type === 'counter') {
+        counter.textContent = 'Сообщений: ' + packet.total;
+      } else if (packet.type === 'error') {
+        line('[Ошибка] ' + packet.code + ': ' + packet.message);
+      }
+    });
+
+    socket.addEventListener('close', (event) => {
+      status.textContent = 'Отключено (код ' + event.code + ')';
+      connectBtn.disabled = false;
+      disconnectBtn.disabled = true;
+      sendBtn.disabled = true;
+      users.textContent = 'Онлайн: -';
+      line('[Система] Соединение закрыто');
+    });
+
+    socket.addEventListener('error', () => {
+      line('[Ошибка] Проблема с WebSocket');
+    });
+  });
+
+  sendBtn.addEventListener('click', () => {
+    const text = messageInput.value.trim();
+    if (!text || !socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({ type: 'chat', text }));
+    messageInput.value = '';
+  });
+
+  messageInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') sendBtn.click();
+  });
+
+  disconnectBtn.addEventListener('click', () => {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.close(1000, 'Выход из чата');
+    }
+  });
+</script>
+</body>
+</html>`;
+
+function send(ws, data) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(data));
+  }
+}
+
+function broadcast(data) {
+  for (const ws of clients.keys()) send(ws, data);
+}
+
+function online() {
+  return [...clients.values()]
+    .filter(c => c.name !== null)
+    .map(c => ({ name: c.name, joinedAt: c.joinedAt }));
+}
+
+function error(ws, code, message) {
+  send(ws, { type: 'error', code, message });
+}
+
+function isRateLimited(state) {
+  const now = Date.now();
+  state.history = state.history.filter(t => now - t < RATE_LIMIT.windowMs);
+  if (state.history.length >= RATE_LIMIT.max) return true;
+  state.history.push(now);
+  return false;
+}
+
+// HTTP сервер 
+const server = http.createServer((req, res) => {
+  if (req.method !== 'GET' || req.url !== '/') {
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Не найдено');
+    return;
+  }
+  res.writeHead(200, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store'
+  });
+  res.end(HTML);
+});
+
+const wss = new WebSocketServer({
+  server,
+  path: '/ws',
+  maxPayload: 2048
+});
+
+wss.on('connection', (ws, req) => {
+  ws.on('error', (e) => console.error('[WS ERROR]', e.message));
+
+  if (clients.size >= MAX_CLIENTS) {
+    ws.close(1013, 'Server busy');
+    return;
+  }
+
+  const state = { name: null, joinedAt: null, history: [] };
+  clients.set(ws, state);
+  console.log('[CONNECT]', req.socket.remoteAddress);
+
+  send(ws, { type: 'info', text: 'Подключение установлено' });
+
+  ws.on('message', (raw, isBinary) => {
+    if (isBinary) { error(ws, 'TEXT_ONLY', 'Ожидается текстовый JSON'); return; }
+
+    let packet;
+    try { packet = JSON.parse(raw.toString('utf8')); }
+    catch { error(ws, 'INVALID_JSON', 'Неверный JSON'); return; }
+
+    if (!packet || typeof packet !== 'object' || Array.isArray(packet)) {
+      error(ws, 'INVALID_PACKET', 'Ожидается объект');
+      return;
+    }
+
+    if (packet.type === 'join') {
+      if (state.name !== null) {
+        error(ws, 'ALREADY_JOINED', 'Имя уже задано');
+        return;
+      }
+      const name = packet.name;
+      if (typeof name !== 'string' ||
+          name.trim().length < 1 ||
+          name.trim().length > 20) {
+        error(ws, 'INVALID_NAME', 'Имя: 1–20 символов');
+        return;
+      }
+      const cleanName = name.trim();
+      if (online().some(u => u.name === cleanName)) {
+        error(ws, 'NAME_TAKEN', 'Имя уже занято');
+        return;
+      }
+      state.name = cleanName;
+      state.joinedAt = new Date().toLocaleTimeString('ru-RU');
+
+      send(ws, { type: 'info', text: 'Добро пожаловать, ' + cleanName + '!' });
+
+      broadcast({ type: 'system', text: cleanName + ' подключился' });
+      broadcast({ type: 'online', users: online() });
+      console.log('[JOIN]', cleanName);
+      return;
+    }
+
+    if (state.name === null) {
+      error(ws, 'JOIN_REQUIRED', 'Сначала отправьте join');
+      return;
+    }
+
+    if (packet.type === 'chat') {
+      const text = packet.text;
+      if (typeof text !== 'string' ||
+          text.trim().length < 1 ||
+          text.trim().length > 200) {
+        error(ws, 'INVALID_TEXT', 'Текст: 1–200 символов');
+        return;
+      }
+      const trimmed = text.trim();
+
+      if (trimmed === '/who') {
+        const names = online().map(u => u.name + ' (' + u.joinedAt + ')');
+        send(ws, { type: 'info', text: 'Онлайн: ' + names.join(', ') });
+        return;
+      }
+
+      if (trimmed.startsWith('/pm ')) {
+        const rest = trimmed.slice(4).trim();
+        const spaceIdx = rest.indexOf(' ');
+        if (spaceIdx === -1) {
+          send(ws, { type: 'info', text: 'Формат: /pm <имя> <текст>' });
+          return;
+        }
+        const target = rest.slice(0, spaceIdx).trim();
+        const body = rest.slice(spaceIdx + 1).trim();
+        if (!body) {
+          send(ws, { type: 'info', text: 'Формат: /pm <имя> <текст>' });
+          return;
+        }
+        const recipient = [...clients.entries()]
+          .find(([, c]) => c.name === target);
+        if (!recipient) {
+          error(ws, 'USER_NOT_FOUND', 'Нет пользователя: ' + target);
+          return;
+        }
+        const time = new Date().toLocaleTimeString('ru-RU');
+        send(recipient[0], {
+          type: 'pm', name: state.name, text: body, time
+        });
+        send(ws, {
+          type: 'info',
+          text: 'Личное для ' + target + ' отправлено'
+        });
+        return;
+      }
+
+      if (isRateLimited(state)) {
+        error(ws, 'RATE_LIMIT',
+          'Слишком часто: не более ' + RATE_LIMIT.max + ' за ' +
+          (RATE_LIMIT.windowMs / 1000) + ' с');
+        return;
+      }
+
+      messageCount++;
+      broadcast({
+        type: 'chat',
+        name: state.name,
+        text: trimmed,
+        time: new Date().toLocaleTimeString('ru-RU')
+      });
+      broadcast({ type: 'counter', total: messageCount });
+      console.log('[MESSAGE]', state.name, trimmed.slice(0, 50));
+      return;
+    }
+
+    error(ws, 'UNKNOWN_TYPE', 'Неизвестный тип команды');
+  });
+
+  ws.on('close', (code) => {
+    clients.delete(ws);
+    console.log('[CLOSE]', state.name ?? 'guest', code);
+    if (state.name !== null) {
+      broadcast({ type: 'system', text: state.name + ' отключился' });
+      broadcast({ type: 'online', users: online() });
+    }
+  });
+});
+
+wss.on('error', (e) => console.error('[WSS ERROR]', e.message));
+server.on('error', (e) => console.error('[HTTP ERROR]', e.message));
+
+server.listen(PORT, HOST, () => {
+  console.log('NetLab Chat: http://' + HOST + ':' + PORT);
+});
